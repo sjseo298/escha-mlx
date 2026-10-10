@@ -5,19 +5,31 @@ caching via LRUPromptCache, reasoning-content parsing, tool calls): routes model
 loading through escha_mlx.loader for escha checkpoints. Qwen3.8's native MTP
 head can be enabled without disabling continuous batching.
 
-Adds one serving extension: ``"ignore_eos": true`` in the request body, which
-suppresses end-of-sequence stopping so a request generates exactly max_tokens.
-This is required for honest ISL/OSL benchmarking -- without it a batch DRAINS as
-sequences finish early and the measurement reports a decaying batch rather than
-steady-state throughput (measured: osl_hit_rate 0.04 on random prompts, which
-understated aggregate throughput by ~40%).  It matches the flag vLLM and SGLang
-expose for the same reason.
+Adds two serving extensions: ``"ignore_eos": true`` in the request body, which
+suppresses end-of-sequence stopping so a request generates exactly max_tokens;
+and ``/v1/cache/clear``, which frees MLX's internal buffer LRU without a restart.
+
+The ignore_eos extension is required for honest ISL/OSL benchmarking -- without
+it a batch DRAINS as sequences finish early and the measurement reports a
+decaying batch rather than steady-state throughput (measured: osl_hit_rate 0.04
+on random prompts, which understated aggregate throughput by ~40%). It matches
+the flag vLLM and SGLang expose for the same reason.
+
+The cache-clear endpoint addresses MLX's per-process GPU resource cap: the Metal
+allocator recycles freed tensors into a byte-bounded pool (max_pool_size is a
+large fraction of unified memory), so on big machines the COUNT of live+cached
+MTLBuffers grows across requests until it hits ``iogpu.rsrc_limit`` (~499k, or
+the sysctl value when set), where any fresh allocation fails with
+``[metal::malloc] Resource limit (N) exceeded.``  That error kills mlx-lm's
+generate thread and zombies the server while /health still reports ok. Calling
+mx.clear_cache() drops cached buffers back to just the active tensors.
 
 Known limitation: mlx_lm.server has no structured output / json_schema
 constrained decoding.
 """
 from __future__ import annotations
 
+import json
 import sys
 
 # A stop-word that cannot occur in real text; carries the ignore_eos intent
@@ -132,6 +144,67 @@ def _install_ignore_eos(server_mod) -> None:
     handler.validate_model_parameters = validate_model_parameters
 
 
+def _install_cache_clear(server_mod) -> None:
+    """Expose GET/POST /v1/cache/clear to release MLX's buffer LRU cache.
+
+    The response reports how many bytes were recycled in the allocator pool and
+    how much is still active, so callers can log the effect of a clear.
+    """
+    import mlx.core as mx
+
+    handler = server_mod.APIHandler
+
+    def _clear_cache_response(self):
+        try:
+            cached_before = int(mx.get_cache_memory())
+        except Exception:
+            cached_before = 0
+        if cached_before > 0:
+            mx.clear_cache()
+        payload = {
+            "object": "cache.clear",
+            "status": "ok",
+            "cached_bytes_before": cached_before,
+            "freed_bytes": max(0, cached_before - int(mx.get_cache_memory())),
+            "active_bytes": int(mx.get_active_memory()),
+        }
+        body = json.dumps(payload).encode("utf-8")
+        self._set_completion_headers(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+            self.wfile.flush()
+        except Exception:
+            pass
+
+    handler._escha_clear_cache_response = _clear_cache_response
+
+    orig_do_get = handler.do_GET
+
+    def do_GET(self):
+        if self.path.split("?", 1)[0] == "/v1/cache/clear":
+            return self._escha_clear_cache_response()
+        return orig_do_get(self)
+
+    handler.do_GET = do_GET
+
+    orig_do_post = handler.do_POST
+
+    def do_POST(self):
+        if self.path.split("?", 1)[0] == "/v1/cache/clear":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length > 0:
+                self.rfile.read(min(length, 65536))
+            return self._escha_clear_cache_response()
+        return orig_do_post(self)
+
+    handler.do_POST = do_POST
+
+
 def main() -> None:
     argv, mtp_enabled = _consume_mtp_args(sys.argv)
     sys.argv[:] = argv
@@ -170,6 +243,7 @@ def main() -> None:
 
         _server.BatchGenerator = MTPBatchGenerator
     _install_ignore_eos(_server)
+    _install_cache_clear(_server)
     sys.argv[0] = "escha_mlx.server"
     _server.main()
 

@@ -205,6 +205,101 @@ def _install_cache_clear(server_mod) -> None:
     handler.do_POST = do_POST
 
 
+def _install_tool_prefix_cache_support(server_mod) -> None:
+    """Enable prefix caching and turn-segmentation for messages ending in 'tool'.
+
+    mlx_lm.server's _tokenize intentionally skips segmentation when
+    messages[-1]['role'] != 'user' ('no segmentation needed'), which treats the
+    entire history with a tool output as an unsegmented block. Consequently,
+    BatchGenerator never detects intermediate segment boundaries, fails to insert
+    historical turn prefixes into LRUPromptCache, and forces a cold prefill from
+    token 0 on every subsequent agent step.
+
+    This patch extracts the system prompt and the stable common prefix up to the
+    latest tool/user response so the prefix is saved and reused across agent turns.
+    """
+    orig_tokenize = server_mod.ResponseGenerator._tokenize
+
+    def _tokenize_with_tool_support(self, tokenizer, request, args):
+        prompt, segments, segment_types, initial_state = orig_tokenize(
+            self, tokenizer, request, args
+        )
+        # If mlx_lm bypassed segmentation because role != 'user', but we have
+        # a chat request with multiple messages, segment the system prompt and history.
+        if (
+            request.request_type == "chat"
+            and len(segments) == 1
+            and len(request.messages) > 1
+            and getattr(tokenizer, "has_chat_template", False)
+        ):
+            chat_template_args = self.model_provider.cli_args.chat_template_args
+            if args.chat_template_kwargs:
+                chat_template_args = chat_template_args.copy()
+                chat_template_args.update(args.chat_template_kwargs)
+            template_kwargs = dict(
+                tools=request.tools,
+                tokenize=True,
+                **chat_template_args,
+            )
+
+            # 1. Detect system prompt boundary
+            num_system = 0
+            for m in request.messages:
+                if m.get("role") == "system":
+                    num_system += 1
+                else:
+                    break
+
+            sys_end = 0
+            new_segments = []
+            new_types = []
+
+            if num_system > 0:
+                sys_tokens = tokenizer.apply_chat_template(
+                    request.messages[:num_system] + [{"role": "user", "content": ""}],
+                    add_generation_prompt=False,
+                    **template_kwargs,
+                )
+                for i, (a, b) in enumerate(zip(sys_tokens, prompt)):
+                    if a != b:
+                        sys_end = i
+                        break
+                if 0 < sys_end < len(prompt):
+                    new_segments.append(prompt[:sys_end])
+                    new_types.append("system")
+
+            # 2. Detect prefix boundary up to the second-to-last message (historical context)
+            if len(request.messages) > num_system + 1:
+                hist_tokens = tokenizer.apply_chat_template(
+                    request.messages[:-1],
+                    add_generation_prompt=True,
+                    **template_kwargs,
+                )
+                hist_end = 0
+                for i, (a, b) in enumerate(zip(hist_tokens, prompt)):
+                    if a != b:
+                        hist_end = i
+                        break
+                else:
+                    hist_end = len(hist_tokens)
+
+                if hist_end > sys_end and hist_end < len(prompt):
+                    new_segments.append(prompt[sys_end:hist_end])
+                    new_types.append("user")
+                    sys_end = hist_end
+
+            if sys_end < len(prompt):
+                new_segments.append(prompt[sys_end:])
+                new_types.append("assistant")
+
+            if new_segments:
+                return prompt, new_segments, new_types, initial_state
+
+        return prompt, segments, segment_types, initial_state
+
+    server_mod.ResponseGenerator._tokenize = _tokenize_with_tool_support
+
+
 def main() -> None:
     argv, mtp_enabled = _consume_mtp_args(sys.argv)
     sys.argv[:] = argv
@@ -244,6 +339,7 @@ def main() -> None:
         _server.BatchGenerator = MTPBatchGenerator
     _install_ignore_eos(_server)
     _install_cache_clear(_server)
+    _install_tool_prefix_cache_support(_server)
     sys.argv[0] = "escha_mlx.server"
     _server.main()
 

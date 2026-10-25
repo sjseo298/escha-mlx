@@ -84,6 +84,8 @@ python bench/p0_gates.py      # kernel gates + measured DRAM-side GB/s
 `pytest tests/` is safe anywhere: without Metal the kernel gates skip (the reference and
 repack tests still run, even on Linux with `mlx[cpu]`), and without a downloaded
 checkpoint the end-to-end tests skip. On a Mac with the model present, everything runs.
+The full picture — layers, checkpoint format, data flow, kernel surface, and the
+numerical contracts — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 First run on a new machine? Follow [RUNBOOK.md](RUNBOOK.md) — gates first, then
 generation, then serving.
 
@@ -330,7 +332,7 @@ campaign — including every negative result, so you don't repeat them:
 | `escha_mlx/{generate,server}.py` | CLI / OpenAI-compatible server |
 | `tests/` + `tests/data/` | golden-gated suite + the committed reference vectors |
 | `bench/` | gates, roofline, serving grid, head-to-head; results per machine under `bench/results/` |
-| `docs/` | install & tuning · performance · full campaign record |
+| `docs/` | architecture · install & tuning · performance · full campaign record |
 
 Everything outside the Metal kernels is pure MLX; attention and the KV caches come
 from mlx-lm untouched. The one exception is the GDN recurrent state: by default it is
